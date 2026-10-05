@@ -49,6 +49,15 @@ DEFAULT_PLANS = [
     {"name": "Monthly", "term": "monthly", "price": "$2", "here": 2, "everyone": 1, "category": 1},
     {"name": "Lifetime", "term": "lifetime", "price": "$10", "here": 3, "everyone": 1, "category": 2},
 ]
+FREE_SLOT_MARKER = ".gg/ntxslots"
+FREE_SLOT_PLAN = {"name": "Free Slot", "days": None, "price": "Free", "here": 1, "everyone": 0, "category": 2}
+SLOT_CATEGORY_NAMES = {1: "Notix Slots · Paid", 2: "Notix Slots · Free 1", 3: "Notix Slots · Free 2"}
+TICKET_CATEGORY_NAMES = {
+    "get": "Notix Tickets · Get Slot",
+    "renew": "Notix Tickets · Renew",
+    "support": "Notix Tickets · Support",
+}
+TICKET_PREFIXES = {"get": "get", "renew": "renew", "support": "support"}
 DEFAULT_CONFIG = {
     "prefix": ".", "timezone": "UTC", "plans": DEFAULT_PLANS,
     "reminder_days": 2, "grace_days": 3, "expiry_minutes": 30,
@@ -347,6 +356,7 @@ def make_slot(guild_id: int, owner_id: int, plan: dict, cfg: dict) -> tuple[dict
         "notice_at": None, "grace_until": None, "state": "provisioning",
         "here_used": 0, "everyone_used": 0, "ping_day": day_and_reset(cfg)[0],
         "last_clear_day": day_and_reset(cfg)[0], "key_hash": digest,
+        "slot_type": "paid",
     }
     return slot, key
 
@@ -416,9 +426,10 @@ def render_banner(slot: dict, name: str, avatar: bytes | None, style: int = 1) -
 
 
 class NotixBot(commands.Bot):
-    def __init__(self, cfg: dict, owner_ids: set[int]):
+    def __init__(self, cfg: dict, owner_ids: set[int], guild_id: int):
         intents = discord.Intents.default()
         intents.members = True
+        intents.presences = True
         intents.message_content = True
         super().__init__(command_prefix=lambda bot, msg: bot.cfg["prefix"],
                          intents=intents, help_command=None, allowed_mentions=NO_MENTIONS,
@@ -426,6 +437,7 @@ class NotixBot(commands.Bot):
                          activity=discord.Game(name="Notix Slots • /help"))
         self.cfg = cfg
         self.configured_owners = owner_ids
+        self.guild_id = guild_id
         self.pool: asyncpg.Pool | None = None
         self.store: Store | None = None
         self.http_runner: web.AppRunner | None = None
@@ -451,12 +463,17 @@ class NotixBot(commands.Bot):
             override = await conn.fetchval("SELECT data FROM ns_settings WHERE id=1") or {}
             self.cfg = validate_config({**environment_config(), **override})
         self.add_view(RecoveryView(self))
-        await self.tree.sync()  # Global commands also support the bot's DM conversation.
-        fast_guild = os.environ.get("GUILD_ID", "").strip()
-        if fast_guild:
-            target = discord.Object(id=snowflake(fast_guild, "GUILD_ID"))
-            self.tree.copy_global_to(guild=target)
-            await self.tree.sync(guild=target)
+        self.add_view(TicketPanelView(self))
+        self.add_view(GetSlotChoiceView(self))
+        self.add_view(FreeStatusConfirmView(self))
+        self.add_view(TicketCloseView(self))
+        # Keep one slash-command registration surface: guild-only. Syncing both global and
+        # guild commands makes commands appear twice in the configured server.
+        target = discord.Object(id=self.guild_id)
+        self.tree.copy_global_to(guild=target)
+        await self.tree.sync(guild=target)
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
         app = web.Application()
         app.router.add_get("/health", self.health)
         self.http_runner = web.AppRunner(app, access_log=None)
@@ -489,16 +506,24 @@ class NotixBot(commands.Bot):
                 self.pool.terminate()
 
     async def on_ready(self):
-        LOG.info("%s connected as %s; %s guild(s)", BRAND, self.user, len(self.guilds))
+        LOG.info("%s connected as %s; configured guild %s", BRAND, self.user, self.guild_id)
+        for guild in list(self.guilds):
+            if guild.id != self.guild_id:
+                LOG.warning("Leaving unauthorized guild %s (%s)", guild.name, guild.id)
+                with contextlib.suppress(discord.HTTPException):
+                    await guild.leave()
+
+    def allowed_guild(self, guild: discord.Guild | None) -> bool:
+        return bool(guild and guild.id == self.guild_id)
 
     def owner(self, user_id: int, guild: discord.Guild | None) -> bool:
         return user_id in self.configured_owners or bool(guild and guild.owner_id == user_id)
 
     async def permitted(self, user, guild, level: str, conn=None) -> bool:
+        if not self.allowed_guild(guild):
+            return False
         if level == "any":
             return True
-        if guild is None:
-            return False
         if self.owner(user.id, guild):
             return True
         if level == "owner":
@@ -508,6 +533,8 @@ class NotixBot(commands.Bot):
         return user.id in data.get("admins", []) or bool(member and member.guild_permissions.administrator)
 
     async def require(self, ctx, level="any"):
+        if not self.allowed_guild(ctx.guild):
+            raise UserError("This bot only works in the server configured by the Railway GUILD_ID variable.")
         if not await self.permitted(ctx.author, ctx.guild, level):
             raise UserError("Server owner access is required." if level == "owner" else
                             "Notix admin access is required. Run this command in your server.")
@@ -560,12 +587,154 @@ class NotixBot(commands.Bot):
                 manage_messages=False, manage_channels=False, manage_webhooks=False)
         return result
 
+    def status_marker_present(self, member: discord.Member | None) -> bool | None:
+        """Return True/False when presence is observable, None when Discord cannot verify it."""
+        if member is None or getattr(member, "raw_status", "offline") == "offline":
+            return None
+        marker = FREE_SLOT_MARKER.casefold()
+        for activity in getattr(member, "activities", ()):
+            values = [getattr(activity, "name", None), getattr(activity, "state", None),
+                      getattr(activity, "details", None)]
+            if any(isinstance(value, str) and marker in value.casefold() for value in values):
+                return True
+        return False
+
+    async def reset_and_verify(self, guild, data, slot, conn) -> bool:
+        """Reset daily ping usage and enforce free-slot status on that same reset boundary."""
+        if not reset_usage(slot, self.cfg):
+            return True
+        if slot.get("slot_type") != "free":
+            await self.store.save_slot(slot, conn)
+            return True
+        member = guild.get_member(slot["owner_id"])
+        state = self.status_marker_present(member)
+        if state is None:
+            # Offline/unavailable presence is not proof that the status was removed.
+            await self.store.save_slot(slot, conn)
+            return True
+        if state:
+            slot.pop("status_warning_at", None)
+            await self.store.save_slot(slot, conn)
+            return True
+        if not slot.get("status_warning_at"):
+            await self.notify_owner(guild, slot, "Free slot status missing",
+                f"Discord no longer shows `{FREE_SLOT_MARKER}` in your custom status. Re-equip it before the next "
+                "daily ping reset or your free slot will be removed.")
+            slot["status_warning_at"] = stamp(now_utc())
+            await self.store.save_slot(slot, conn)
+            return True
+        await self.notify_owner(guild, slot, "Free slot removed",
+            f"`{FREE_SLOT_MARKER}` was still missing at the next daily ping reset, so your free slot is being removed.")
+        await self.revoke(guild, data, slot, "Required free-slot status was removed and not restored", conn)
+        return False
+
+    async def ticket_overwrites(self, guild, data, member, *, owner_only=False):
+        deny = discord.PermissionOverwrite(view_channel=False, read_message_history=False)
+        user = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True,
+                                           embed_links=True, attach_files=True, add_reactions=True)
+        manage = discord.PermissionOverwrite(view_channel=True, read_message_history=True, send_messages=True,
+                                             manage_messages=True, manage_channels=True, embed_links=True,
+                                             attach_files=True, add_reactions=True)
+        result = {guild.default_role: deny, guild.me: manage, member: user}
+        owner_ids = set(self.configured_owners) | {guild.owner_id}
+        for owner_id in owner_ids:
+            owner = guild.get_member(owner_id) or await self.member(guild, owner_id)
+            if owner:
+                result[owner] = manage
+        if not owner_only:
+            role = self.role(guild, data.get("staff_role", 0))
+            if role:
+                result[role] = manage
+        return result
+
+    def ticket_info(self, channel) -> tuple[str, int] | None:
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        match = re.search(r"(?:^|\s)notix-ticket:v1:(get|renew|support):(\d{1,19})(?:\s|$)", channel.topic or "")
+        return (match.group(1), int(match.group(2))) if match else None
+
+    async def create_ticket(self, interaction: discord.Interaction, kind: str):
+        guild = interaction.guild
+        if not self.allowed_guild(guild):
+            raise UserError("This panel only works in the configured server.")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if kind not in TICKET_PREFIXES:
+            raise UserError("Unknown ticket type.")
+        member = guild.get_member(interaction.user.id)
+        if not member or member.bot:
+            raise UserError("Only server members can open tickets.")
+        async with self.store.lock(guild.id) as conn:
+            data = await self.store.guild(guild.id, conn)
+            category_id = data.get(f"ticket_{kind}_category")
+            category = guild.get_channel(category_id)
+            if not isinstance(category, discord.CategoryChannel):
+                raise UserError("Run /setup before using the ticket panel.")
+            for channel in guild.text_channels:
+                info = self.ticket_info(channel)
+                if info == (kind, member.id):
+                    await interaction.followup.send(f"You already have this ticket open: {channel.mention}", ephemeral=True)
+                    return
+            base = re.sub(r"[^a-z0-9-]", "-", member.name.lower()).strip("-")[:70] or str(member.id)
+            channel = await guild.create_text_channel(
+                f"{TICKET_PREFIXES[kind]}-{base}", category=category,
+                topic=f"{BRAND} | notix-ticket:v1:{kind}:{member.id}",
+                overwrites=await self.ticket_overwrites(guild, data, member),
+                reason=f"{BRAND} {kind} ticket")
+            if kind == "get":
+                card = embed("Get a slot", "Choose **Paid Slot** or **Free Slot** below.")
+                view = GetSlotChoiceView(self)
+            elif kind == "renew":
+                card = embed("Renew Slot", "Describe which slot you want to renew. A moderator can review and close this ticket.")
+                view = TicketCloseView(self)
+            else:
+                card = embed("Support", "Describe what you need help with. A moderator can review and close this ticket.")
+                view = TicketCloseView(self)
+            await channel.send(content=member.mention, embed=card, view=view,
+                               allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
+        await interaction.followup.send(f"Created {channel.mention}.", ephemeral=True)
+
+    async def grant_free_slot(self, interaction: discord.Interaction) -> tuple[dict, bool]:
+        guild = interaction.guild
+        if not self.allowed_guild(guild):
+            raise UserError("This ticket only works in the configured server.")
+        member = guild.get_member(interaction.user.id)
+        if not member:
+            raise UserError("You must still be a member of this server.")
+        status = self.status_marker_present(member)
+        if status is None:
+            raise UserError("Discord cannot currently verify your custom status while your presence is offline/unavailable. "
+                            f"Come online with `{FREE_SLOT_MARKER}` visible, then click Yes again.")
+        if not status:
+            raise UserError(f"I cannot see `{FREE_SLOT_MARKER}` in your current Discord custom status. "
+                            "Add it, wait for Discord to update your presence, then click Yes again.")
+        async with self.store.lock(guild.id) as conn:
+            data = await self.store.guild(guild.id, conn)
+            if not data.get("owner_role") or data.get("wiping"):
+                raise UserError("Run /setup first, or wait for the reset to finish.")
+            existing = [slot for slot in await self.store.slots(guild.id, conn)
+                        if slot["owner_id"] == member.id and slot.get("slot_type") == "free"]
+            if existing:
+                raise UserError(f"You already have a free slot: <#{existing[0]['channel_id']}>.")
+            plan = copy.deepcopy(FREE_SLOT_PLAN)
+            slot, key = make_slot(guild.id, member.id, plan, self.cfg)
+            slot["slot_type"] = "free"
+            slot["required_status"] = FREE_SLOT_MARKER
+            slot["status_warning_at"] = None
+            await self.provision(guild, data, slot, conn)
+            delivered = await self.send_key(member.id, key, slot["channel_id"])
+            await self.audit(guild, "slot-created", f"Free status slot <#{slot['channel_id']}> granted to "
+                             f"<@{member.id}> after verifying `{FREE_SLOT_MARKER}`.", conn)
+            return slot, delivered
+
     async def ensure_setup(self, guild, count: int, conn) -> dict:
         needed = ("manage_channels", "manage_roles", "manage_messages", "manage_webhooks",
                   "view_channel", "send_messages", "read_message_history", "embed_links", "attach_files", "mention_everyone")
         missing = [name for name in needed if not getattr(guild.me.guild_permissions, name)]
         if missing:
             raise UserError("The bot needs these server permissions: " + ", ".join(missing))
+        if guild.id != self.guild_id:
+            raise UserError("This bot only works in the configured GUILD_ID server.")
+        count = max(3, count)
         data = await self.store.guild(guild.id, conn)
         await self.store.save_guild(guild.id, data, conn)
         roles = await guild.fetch_roles()
@@ -593,13 +762,17 @@ class NotixBot(commands.Bot):
         existing = {c.id: c for c in channels}
         data["categories"] = [c for c in data.get("categories", [])
                               if isinstance(existing.get(c["id"]), discord.CategoryChannel)]
-        for group in range(1, max(count, max(p["category"] for p in self.cfg["plans"])) + 1):
+        for group in (1, 2, 3):
             if not any(c["group"] == group for c in data["categories"]):
                 await self.new_category(guild, data, group, conn)
         for c in data["categories"]:
             category = existing.get(c["id"]) or guild.get_channel(c["id"])
             if category:
-                await category.edit(overwrites=self.overwrites(guild, data), reason=f"{BRAND} reconcile")
+                base_name = SLOT_CATEGORY_NAMES.get(c["group"], f"Notix Slots · {c['group']}")
+                siblings = [x for x in data["categories"] if x["group"] == c["group"]]
+                suffix = "" if len(siblings) == 1 or c is siblings[0] else f" · {siblings.index(c)+1}"
+                await category.edit(name=base_name + suffix, overwrites=self.overwrites(guild, data),
+                                    reason=f"{BRAND} reconcile")
         for key, name, private in (("info_category", "Notix Slots · Information", False),
                                     ("log_category", "Notix Slots · Staff Logs", True)):
             category = existing.get(data.get(key))
@@ -610,6 +783,22 @@ class NotixBot(commands.Bot):
                 await self.store.save_guild(guild.id, data, conn)
             else:
                 await category.edit(overwrites=self.overwrites(guild, data, private=private, webhook_only=private))
+        for kind, name in TICKET_CATEGORY_NAMES.items():
+            key = f"ticket_{kind}_category"
+            category = existing.get(data.get(key)) or guild.get_channel(data.get(key))
+            ticket_category_permissions = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True, send_messages=True,
+                                                      read_message_history=True),
+            }
+            if not isinstance(category, discord.CategoryChannel):
+                category = await guild.create_category(name, overwrites=ticket_category_permissions,
+                                                       reason=f"{BRAND} ticket setup")
+                data[key] = category.id
+                await self.store.save_guild(guild.id, data, conn)
+            else:
+                await category.edit(name=name, overwrites=ticket_category_permissions,
+                                    reason=f"{BRAND} ticket reconcile")
         for kind in AUDIT_KINDS:
             item = data.setdefault("logs", {}).get(kind, {})
             channel = await self.text_channel(guild, item.get("channel_id"))
@@ -659,7 +848,10 @@ class NotixBot(commands.Bot):
 
     async def new_category(self, guild, data, group, conn):
         number = data.get("next_category", 1)
-        category = await guild.create_category(f"Notix Slots · {number}",
+        same_group = [c for c in data.get("categories", []) if c.get("group") == group]
+        base_name = SLOT_CATEGORY_NAMES.get(group, f"Notix Slots · {group}")
+        name = base_name if not same_group else f"{base_name} · {len(same_group)+1}"
+        category = await guild.create_category(name,
             overwrites=self.overwrites(guild, data), reason=f"{BRAND} category")
         data.setdefault("categories", []).append({"group": group, "number": number, "id": category.id})
         data["next_category"] = number + 1
@@ -673,6 +865,21 @@ class NotixBot(commands.Bot):
                 if isinstance(category, discord.CategoryChannel) and len(category.channels) < 50:
                     return category
         return await self.new_category(guild, data, group, conn)
+
+    async def slot_category_for(self, guild, data, slot, conn):
+        if slot.get("slot_type") != "free":
+            return await self.category_for(guild, data, 1, conn)
+        candidates = []
+        for group in (2, 3):
+            for item in data.get("categories", []):
+                if item.get("group") == group:
+                    category = guild.get_channel(item["id"])
+                    if isinstance(category, discord.CategoryChannel) and len(category.channels) < 50:
+                        candidates.append(category)
+                        break
+        if not candidates:
+            return await self.new_category(guild, data, 2, conn)
+        return min(candidates, key=lambda category: len(category.channels))
 
     def plans_embed(self):
         card = embed("Notix Slots · Plans", "Contact staff to purchase a slot. All daily allowances reset at midnight in "
@@ -795,10 +1002,10 @@ class NotixBot(commands.Bot):
         created = False
         if not channel:
             member = await self.member(guild, slot["owner_id"])
-            base = member.display_name if member else str(slot["owner_id"])
-            name = re.sub(r"[^a-z0-9-]", "-", base.lower()).strip("-")[:65] or "owner"
-            category = await self.category_for(guild, data, slot["plan"]["category"], conn)
-            channel = await guild.create_text_channel(f"slot-{name}", category=category,
+            base = member.name if member else str(slot["owner_id"])
+            name = re.sub(r"[^a-z0-9-]", "-", base.lower()).strip("-")[:90] or "owner"
+            category = await self.slot_category_for(guild, data, slot, conn)
+            channel = await guild.create_text_channel(name, category=category,
                 topic=f"{BRAND} | notix:{slot['id']}", overwrites=self.overwrites(guild, data),
                 reason=f"{BRAND} provision")
             created = True
@@ -822,6 +1029,15 @@ class NotixBot(commands.Bot):
         await self.repair(guild, data, slot, conn)
 
     async def repair(self, guild, data, slot, conn):
+        channel = await self.text_channel(guild, slot.get("channel_id"))
+        if channel:
+            if slot.get("slot_type") == "free":
+                allowed = {item["id"] for item in data.get("categories", []) if item.get("group") in (2, 3)}
+            else:
+                allowed = {item["id"] for item in data.get("categories", []) if item.get("group") == 1}
+            if channel.category_id not in allowed:
+                category = await self.slot_category_for(guild, data, slot, conn)
+                await channel.edit(category=category, reason=f"{BRAND} slot category reconcile")
         await self.apply_permissions(guild, data, slot)
         await self.sync_roles(guild, data, slot["owner_id"], conn)
         previous_owner = slot.get("previous_owner_id")
@@ -930,7 +1146,9 @@ class NotixBot(commands.Bot):
                 raise UserError("You no longer own this slot.")
             if not is_open(slot):
                 raise UserError("This slot is held, expired, or closing. It cannot accept posts.")
-            reset_usage(slot, self.cfg)
+            data = await self.store.guild(guild.id, conn)
+            if not await self.reset_and_verify(guild, data, slot, conn):
+                raise UserError("Your free slot was removed because the required status was not restored.")
             here, everyone = mention_counts(content)
             if slot["here_used"] + here > slot["plan"]["here"] or slot["everyone_used"] + everyone > slot["plan"]["everyone"]:
                 raise UserError("That post exceeds your remaining ping allowance. No message was sent.")
@@ -968,6 +1186,8 @@ class NotixBot(commands.Bot):
     async def on_message(self, message):
         if message.author.bot or not self.store:
             return
+        if message.guild is None or message.guild.id != self.guild_id:
+            return
         if message.guild:
             try:
                 slot = await self.store.by_channel(message.channel.id)
@@ -982,7 +1202,9 @@ class NotixBot(commands.Bot):
                             return
                         if message.mention_everyone:
                             here, everyone = mention_counts(message.content)
-                            reset_usage(slot, self.cfg)
+                            data = await self.store.guild(message.guild.id, conn)
+                            if not await self.reset_and_verify(message.guild, data, slot, conn):
+                                return
                             async with conn.transaction():
                                 first = await conn.fetchval("INSERT INTO ns_processed_messages(message_id) VALUES($1) "
                                     "ON CONFLICT DO NOTHING RETURNING message_id", message.id)
@@ -1007,7 +1229,7 @@ class NotixBot(commands.Bot):
                 # A prefix /say in a server already delivered its own broadcast mention.
                 ctx = await self.get_context(message)
                 if ctx.command and ctx.command.name == "say" and message.mention_everyone:
-                    await message.channel.send("Use slash `/say` or DM the bot when your advert contains a broadcast mention.")
+                    await message.channel.send("Use slash `/say` when your advert contains a broadcast mention.")
                     return
             except Exception as error:
                 LOG.error("Message enforcement failed in guild %s (%s)", message.guild.id, type(error).__name__)
@@ -1015,7 +1237,7 @@ class NotixBot(commands.Bot):
         await self.process_commands(message)
 
     async def on_member_join(self, member):
-        if not self.store:
+        if not self.store or member.guild.id != self.guild_id:
             return
         try:
             async with self.store.lock(member.guild.id) as conn:
@@ -1056,14 +1278,7 @@ class NotixBot(commands.Bot):
 
     async def restore_snapshot(self, guild, payload, conn):
         slots = validate_backup(payload)  # Entire file validates before any Discord mutations.
-        categories = payload.get("categories", [])
-        required = max([p["category"] for p in self.cfg["plans"]] + [s["plan"]["category"] for s in slots]
-                       + [c["group"] for c in categories])
-        data = await self.ensure_setup(guild, required, conn)
-        for group in {c["group"] for c in categories}:
-            expected = sum(c["group"] == group for c in categories)
-            while sum(c["group"] == group for c in data["categories"]) < expected:
-                await self.new_category(guild, data, group, conn)
+        data = await self.ensure_setup(guild, 3, conn)
         captured = parse_time(payload["captured_at"])
         created, repaired, missing, failures = 0, 0, 0, []
         current_slots = await self.store.slots(guild.id, conn)
@@ -1141,8 +1356,14 @@ class NotixBot(commands.Bot):
             channel = await self.text_channel(guild, channel_id)
             if channel:
                 await channel.delete(reason=f"{BRAND} wipeout")
+        # Ticket records live in channel topics rather than PostgreSQL; remove managed tickets too.
+        for channel in list(guild.text_channels):
+            if self.ticket_info(channel):
+                with contextlib.suppress(discord.HTTPException):
+                    await channel.delete(reason=f"{BRAND} wipeout")
         category_ids = [c["id"] for c in data.get("categories", [])]
-        category_ids += [data[k] for k in ("info_category", "log_category") if data.get(k)]
+        category_ids += [data[k] for k in ("info_category", "log_category",
+            "ticket_get_category", "ticket_renew_category", "ticket_support_category") if data.get(k)]
         channels = await guild.fetch_channels()
         for category_id in category_ids:
             category = next((c for c in channels if c.id == category_id), None)
@@ -1158,7 +1379,7 @@ class NotixBot(commands.Bot):
     async def maintenance(self):
         if not self.is_ready():
             return
-        rows = await self.pool.fetch("SELECT guild_id FROM ns_guilds")
+        rows = await self.pool.fetch("SELECT guild_id FROM ns_guilds WHERE guild_id=$1", self.guild_id)
         for row in rows:
             guild = self.get_guild(row["guild_id"])
             if not guild:
@@ -1175,8 +1396,8 @@ class NotixBot(commands.Bot):
                                   current - schedule["last_expiry_check"] >= timedelta(minutes=self.cfg["expiry_minutes"]))
                     for slot in await self.store.slots(guild.id, conn):
                         try:
-                            if reset_usage(slot, self.cfg):
-                                await self.store.save_slot(slot, conn)
+                            if not await self.reset_and_verify(guild, data, slot, conn):
+                                continue
                             if slot.get("permissions_dirty") or slot.get("header_dirty"):
                                 await self.repair(guild, data, slot, conn)
                             if expiry_due or slot["state"] in ("closing", "provisioning"):
@@ -1283,7 +1504,7 @@ def restored_slot(source: dict, guild_id: int, captured: datetime, current: date
     slot = {key: copy.deepcopy(source.get(key)) for key in (
         "owner_id", "plan", "created_at", "expires_at", "held_at", "hold_reason",
         "reminder_sent", "notice_at", "grace_until", "here_used", "everyone_used",
-        "ping_day", "last_clear_day", "key_hash")}
+        "ping_day", "last_clear_day", "key_hash", "slot_type", "status_warning_at")}
     slot.update(id=uuid.uuid4().hex, guild_id=guild_id, channel_id=None, header_id=None,
                 state="provisioning", lineage_id=source.get("lineage_id", source["id"]))
     base = parse_time(source.get("held_at")) or captured
@@ -1330,8 +1551,8 @@ class RecoveryModal(discord.ui.Modal, title="Notix Slots · Recover slot"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         guild = interaction.guild
-        if not guild:
-            raise UserError("Recover a slot through the panel in its server.")
+        if not self.bot.allowed_guild(guild):
+            raise UserError("Recover a slot through the panel in the configured server.")
         key = str(self.recovery_key).strip().lower()
         async with self.bot.store.lock(guild.id) as conn:
             # Count invalid keys too; this limiter survives process restarts.
@@ -1355,6 +1576,10 @@ class RecoveryModal(discord.ui.Modal, title="Notix Slots · Recover slot"):
                 raise UserError("This server is being reset.")
             if slot["owner_id"] == interaction.user.id:
                 raise UserError("You already own this slot. Ask staff for /slotkey if you need a new key.")
+            if slot.get("slot_type") == "free":
+                member = guild.get_member(interaction.user.id)
+                if self.bot.status_marker_present(member) is not True:
+                    raise UserError(f"Free slots can only be recovered while `{FREE_SLOT_MARKER}` is visible in your custom status.")
             others = await self.bot.store.slots(guild.id, conn)
             if any(s["owner_id"] == interaction.user.id and s["plan"]["name"].casefold() == slot["plan"]["name"].casefold() for s in others):
                 raise UserError("You already own a slot on this plan. Contact staff before transferring another.")
@@ -1367,6 +1592,8 @@ class RecoveryModal(discord.ui.Modal, title="Notix Slots · Recover slot"):
             replacement, digest = new_key()
             slot.update(owner_id=interaction.user.id, previous_owner_id=slot["owner_id"],
                         key_hash=digest, permissions_dirty=True, header_dirty=True)
+            if slot.get("slot_type") == "free":
+                slot["status_warning_at"] = None
             try:
                 await self.bot.store.save_slot(slot, conn)
             except Exception:
@@ -1401,6 +1628,113 @@ class RecoveryView(discord.ui.View):
     @discord.ui.button(label="Recover slot", style=discord.ButtonStyle.primary, custom_id="notix:recover:v1")
     async def recover(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RecoveryModal(self.bot))
+
+    async def on_error(self, interaction, error, item):
+        await safe_error(interaction, error)
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label="Get Slot", style=discord.ButtonStyle.primary, custom_id="notix:ticket:get:v1")
+    async def get_slot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.bot.create_ticket(interaction, "get")
+
+    @discord.ui.button(label="Renew Slot", style=discord.ButtonStyle.secondary, custom_id="notix:ticket:renew:v1")
+    async def renew_slot(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.bot.create_ticket(interaction, "renew")
+
+    @discord.ui.button(label="Support", style=discord.ButtonStyle.success, custom_id="notix:ticket:support:v1")
+    async def support(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.bot.create_ticket(interaction, "support")
+
+    async def on_error(self, interaction, error, item):
+        await safe_error(interaction, error)
+
+
+class GetSlotChoiceView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    async def owner(self, interaction):
+        info = self.bot.ticket_info(interaction.channel)
+        if not info or info[0] != "get" or info[1] != interaction.user.id:
+            raise UserError("Only the member who opened this Get Slot ticket can choose its slot type.")
+        return interaction.guild.get_member(interaction.user.id)
+
+    @discord.ui.button(label="Paid Slot", style=discord.ButtonStyle.primary, custom_id="notix:ticket:get:paid:v1")
+    async def paid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        member = await self.owner(interaction)
+        if not member:
+            raise UserError("You are no longer a member of this server.")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data = await self.bot.store.guild(interaction.guild_id)
+        await interaction.channel.edit(
+            overwrites=await self.bot.ticket_overwrites(interaction.guild, data, member, owner_only=True),
+            reason=f"{BRAND} paid slot ticket privacy")
+        await interaction.message.edit(
+            embed=embed("Paid Slot", "This ticket is now visible only to you, the configured bot owners, and the server owner. "
+                        "Use it to arrange payment and slot details."),
+            view=TicketCloseView(self.bot))
+        await interaction.followup.send("Paid-slot ticket privacy applied.", ephemeral=True)
+
+    @discord.ui.button(label="Free Slot", style=discord.ButtonStyle.success, custom_id="notix:ticket:get:free:v1")
+    async def free(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.owner(interaction)
+        await interaction.response.edit_message(
+            embed=embed("Free Slot verification",
+                f"Do you currently have `{FREE_SLOT_MARKER}` in your Discord custom status? "
+                "Click **Yes** and I will verify it automatically."),
+            view=FreeStatusConfirmView(self.bot))
+
+    async def on_error(self, interaction, error, item):
+        await safe_error(interaction, error)
+
+
+class FreeStatusConfirmView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success, custom_id="notix:ticket:get:free:yes:v1")
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        info = self.bot.ticket_info(interaction.channel)
+        if not info or info[0] != "get" or info[1] != interaction.user.id:
+            raise UserError("Only the member who opened this Get Slot ticket can verify the free slot.")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        slot, delivered = await self.bot.grant_free_slot(interaction)
+        await interaction.message.edit(
+            embed=embed("Free Slot granted",
+                f"Your free slot is <#{slot['channel_id']}>. Keep `{FREE_SLOT_MARKER}` in your custom status. "
+                "The bot checks it whenever the daily ping allowance resets; a confirmed missing status is warned by DM "
+                "before the slot can be removed."),
+            view=TicketCloseView(self.bot))
+        await interaction.followup.send(
+            "Free slot created. " + ("Your recovery key was sent by DM." if delivered else
+            "Your DMs are closed; ask staff to use /slotkey after enabling DMs."), ephemeral=True)
+
+    async def on_error(self, interaction, error, item):
+        await safe_error(interaction, error)
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="notix:ticket:close:v1")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        info = self.bot.ticket_info(interaction.channel)
+        if not info:
+            raise UserError("This is not a managed ticket channel.")
+        opener_id = info[1]
+        if interaction.user.id != opener_id and not await self.bot.permitted(interaction.user, interaction.guild, "admin"):
+            raise UserError("Only the ticket owner or a moderator can close this ticket.")
+        await interaction.response.send_message("Closing ticket…", ephemeral=True)
+        await interaction.channel.delete(reason=f"{BRAND} ticket closed by {interaction.user}")
 
     async def on_error(self, interaction, error, item):
         await safe_error(interaction, error)
@@ -1462,7 +1796,7 @@ def register_commands(bot: NotixBot):
                      "`/createslot` is slash-only. Slash replies are private unless noted.")
         card.add_field(name="Everyone", value="`/plans` `/ping` `/say` `/pings` `/clear`", inline=False)
         if await bot.permitted(ctx.author, ctx.guild, "admin"):
-            card.add_field(name="Staff", value="`/setup` `/createslot` `/renewslot` `/revokeslot` `/hold` `/unhold` "
+            card.add_field(name="Staff", value="`/setup` `/ticketpanel` `/createslot` `/renewslot` `/revokeslot` `/hold` `/unhold` "
                            "`/holdlist` `/slots` `/slotkey` `/slotbanner` `/wipeout`", inline=False)
         if await bot.permitted(ctx.author, ctx.guild, "owner"):
             card.add_field(name="Server / bot owners", value="`/adminadd` `/adminremove` `/adminlist` `/reload` "
@@ -1481,7 +1815,7 @@ def register_commands(bot: NotixBot):
     async def ping(ctx):
         await ctx.send(f"Notix Slots: {bot.latency * 1000:.0f} ms.", ephemeral=True)
 
-    @bot.hybrid_command(description="Post an advert in your slot, including from DMs")
+    @bot.hybrid_command(description="Post an advert in your slot")
     @app_commands.describe(message="The text to post (2,000 characters maximum)", channel_id="Slot channel ID if you own several")
     @access()
     async def say(ctx, channel_id: str = "", *, message: str):
@@ -1504,8 +1838,10 @@ def register_commands(bot: NotixBot):
             slot = await bot.store.slot(slot["id"], conn)
             if not slot or slot["owner_id"] != ctx.author.id:
                 raise UserError("You no longer own this slot.")
-            reset_usage(slot, bot.cfg)
-            await bot.store.save_slot(slot, conn)
+            data = await bot.store.guild(slot["guild_id"], conn)
+            guild = bot.get_guild(slot["guild_id"])
+            if not guild or not await bot.reset_and_verify(guild, data, slot, conn):
+                raise UserError("Your free slot was removed because the required status was not restored.")
             _, reset = day_and_reset(bot.cfg)
             await ctx.send(embed=embed("Notix Slots · Ping balance",
                 f"<#{slot['channel_id']}>\n"
@@ -1531,11 +1867,11 @@ def register_commands(bot: NotixBot):
 
     @bot.hybrid_command(description="Build or repair Notix roles, categories, panels and slots")
     @access("admin", True)
-    async def setup(ctx, categories: commands.Range[int, 1, 25] = 2):
+    async def setup(ctx):
         await defer(ctx)
         failures = []
         async with bot.store.lock(ctx.guild.id) as conn:
-            data = await bot.ensure_setup(ctx.guild, categories, conn)
+            data = await bot.ensure_setup(ctx.guild, 3, conn)
             for slot in await bot.store.slots(ctx.guild.id, conn):
                 try:
                     if slot["state"] == "closing":
@@ -1546,10 +1882,21 @@ def register_commands(bot: NotixBot):
                         await bot.repair(ctx.guild, data, slot, conn)
                 except Exception as error:
                     failures.append(f"{slot['id'][:8]}: {type(error).__name__}")
-        await ctx.send("Notix Slots setup finished. Use `/createslot` to issue a slot." +
+        await ctx.send("Notix Slots setup finished. Paid/free slot categories and ticket categories are ready. "
+                       "Use `/ticketpanel` to post the ticket panel or `/createslot` to issue a paid slot." +
                        ("\nSlots needing another repair: " + ", ".join(failures)[:1400] if failures else ""), ephemeral=True)
 
-    @bot.tree.command(name="createslot", description="Issue a channel to a buyer on a configured plan")
+    @bot.hybrid_command(description="Send the Get Slot / Renew Slot / Support ticket panel")
+    @access("admin", True)
+    async def ticketpanel(ctx):
+        data = await bot.store.guild(ctx.guild.id)
+        if not all(data.get(f"ticket_{kind}_category") for kind in TICKET_PREFIXES):
+            raise UserError("Run /setup before posting the ticket panel.")
+        card = embed("Notix Slots · Tickets",
+            "Choose **Get Slot**, **Renew Slot**, or **Support** below. Each button opens a private ticket.")
+        await ctx.send(embed=card, view=TicketPanelView(bot))
+
+    @bot.tree.command(name="createslot", description="Issue a paid slot channel on a configured plan")
     @app_commands.guild_only()
     @app_commands.describe(user="Buyer who has joined this server", plan="Choose a configured plan")
     async def createslot(interaction: discord.Interaction, user: discord.Member, plan: str):
@@ -1570,6 +1917,8 @@ def register_commands(bot: NotixBot):
             if duplicate:
                 raise UserError("That member already has this plan. Use /renewslot or choose another plan.")
             slot, key = make_slot(interaction.guild_id, user.id, chosen, bot.cfg)
+            slot["slot_type"] = "paid"
+            slot["plan"]["category"] = 1
             await bot.provision(interaction.guild, data, slot, conn)
             delivered = await bot.send_key(user.id, key, slot["channel_id"])
             await bot.audit(interaction.guild, "slot-created", f"<@{interaction.user.id}> issued "
@@ -1880,13 +2229,14 @@ def register_commands(bot: NotixBot):
 
 async def run():
     cfg = environment_config()
-    for name in ("DISCORD_TOKEN", "DATABASE_URL"):
+    for name in ("DISCORD_TOKEN", "DATABASE_URL", "GUILD_ID"):
         if not os.environ.get(name, "").strip():
             raise ValueError(f"Missing Railway variable: {name}")
     if not os.environ["DATABASE_URL"].startswith(("postgres://", "postgresql://")):
         raise ValueError("DATABASE_URL must be a PostgreSQL connection URL")
     owners = {snowflake(value.strip(), "OWNER_IDS") for value in os.environ.get("OWNER_IDS", "").split(",") if value.strip()}
-    bot = NotixBot(cfg, owners)
+    guild_id = snowflake(os.environ["GUILD_ID"].strip(), "GUILD_ID")
+    bot = NotixBot(cfg, owners, guild_id)
     register_commands(bot)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
